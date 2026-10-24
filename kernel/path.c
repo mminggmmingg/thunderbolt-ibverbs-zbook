@@ -1840,6 +1840,24 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 					packet->start_credit_group_frames,
 					path->tx_remote_data_credit_max);
 
+			/*
+			 * raw stream 이 시작되면 끝날 때까지 이 경로는 그 스트림 프레임만 보내고
+			 * 제어 큐(크레딧 반환·ACK)는 막힌다. 32 크레딧만으로 시작하면 스트림 중간에
+			 * 크레딧이 바닥날 수 있고, 상대도 자기 raw stream 중이면 서로 크레딧을
+			 * 돌려주지 못해 레일이 영구 정지한다(2026-10-25 실측: 양 노드 tx_credits=0/768,
+			 * control_tx_queue_max_ms≈7s). 스트림 전체 프레임만큼 미리 확보한 뒤에만 시작한다.
+			 */
+			if (packet->raw_stream_start) {
+				start_credit_required = min_t(u32,
+					packet->start_credit_group_frames,
+					path->tx_remote_data_credit_max);
+				if (packet->start_credit_group_frames >
+				    path->tx_remote_data_credit_max)
+					pr_warn_ratelimited("raw stream %u frames > credit window %u — can still stall\n",
+							    packet->start_credit_group_frames,
+							    path->tx_remote_data_credit_max);
+			}
+
 			if (path->tx_remote_data_credits <
 			    max_t(u32, 1, start_credit_required)) {
 				if (state)
