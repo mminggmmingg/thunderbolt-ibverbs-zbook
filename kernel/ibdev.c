@@ -6722,6 +6722,12 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 		if (check_add_overflow(offset, (size_t)mr->dmabuf_offset, &offset))
 			return -EINVAL;
 		iosys_map_memcpy_to(&mr->dmabuf_map, offset, src, len);
+		/* VRAM dma-buf 의 vmap 은 ioremap_wc(쓰기결합)일 수 있다. WC 저장은 약한 순서라
+		 * 뒤따르는 CQE 기록/smp_store_release(x86 에선 컴파일러 배리어뿐)보다 늦게
+		 * 메모리에 도달할 수 있고, 그러면 유저가 완료를 보고 GPU 가 읽을 때 이전 내용이
+		 * 남아 있다(2026-10-24 vLLM ASYNC 에서 seq 태그가 4칸 전 값으로 관측). 완료 통지 전에
+		 * WC 버퍼를 배출한다. */
+		wmb();
 		return 0;
 	}
 	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
