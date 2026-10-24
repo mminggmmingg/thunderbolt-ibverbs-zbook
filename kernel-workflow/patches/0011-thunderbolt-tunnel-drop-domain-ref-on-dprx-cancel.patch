@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] thunderbolt: tunnel: drop domain reference when DPRX work is
+ canceled
+
+tb_tunnel_one_dp() passes tb_domain_get(tb) as @callback_data, and the
+reference is dropped only by the callback (tb_dp_tunnel_active() ->
+tb_domain_put()). When a DP tunnel is torn down before its DPRX work
+runs, tb_dp_dprx_stop() cancels the work and drops only the tunnel
+reference, so the callback never runs and the domain reference leaks.
+
+On kernels that wait for nhi->domain_released in the PCI remove/shutdown
+path (Ubuntu linux-oem-7.0 7.0.0-1015, carrying a v7.2-rc1 backport),
+the leak turns into a permanent hang at shutdown/reboot. Reproduced on
+HP ZBook Ultra G1a with a Belkin TB4 5-in-1 Core Hub (0x13:0x6e) whose
+DP OUT adapter flaps right after plug-in: 4/4 shutdowns hung before,
+clean shutdown after this change.
+
+Only tb_tunnel_one_dp() passes a callback (test.c passes NULL), always
+with a domain reference. If cancel fails the work is running and the
+callback drops the reference itself, so there is no double put.
+
+---
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -1136,8 +1136,20 @@
+ 	if (tunnel->dprx_started) {
+ 		tunnel->dprx_started = false;
+ 		tunnel->dprx_canceled = true;
+-		if (cancel_delayed_work(&tunnel->dprx_work))
++		if (cancel_delayed_work(&tunnel->dprx_work)) {
++			/*
++			 * The work will not run, so neither will @callback, which is
++			 * what drops the domain reference tb_tunnel_one_dp() handed us
++			 * in @callback_data. Drop it here instead, otherwise the domain
++			 * never gets released and nhi_pci_shutdown() waits forever
++			 * (seen with a TB4 hub whose DP OUT adapter flaps on plug).
++			 * Only tb_tunnel_one_dp() passes a callback, always with a
++			 * domain reference.
++			 */
++			if (tunnel->callback)
++				tb_domain_put(tunnel->callback_data);
+ 			tb_tunnel_put(tunnel);
++		}
+ 	}
+ }
+ 
+-- 
+2.53.0
