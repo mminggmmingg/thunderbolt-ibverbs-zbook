@@ -85,6 +85,27 @@ module_param(native_tx_max_inflight, uint, 0644);
 MODULE_PARM_DESC(native_tx_max_inflight,
 		 "Maximum native data TX descriptors posted per path before waiting for completions; 0 disables native throttling");
 
+/*
+ * hot-poll 손포팅(2026-10-21) — 근거: ftrace 프로파일에서 프레임당 비용이 지배적이었다.
+ *   tbv_path_rx_complete 909만회(16.6%), tbv_path_schedule_tx 981만회,
+ *   tbv_path_queue_delayed_work 913만회 vs 실제 복사 1.9%.
+ * NHI 프레임 콜백이 커널 "events" kworker(NORMAL 우선순위) 홉을 거치므로 프레임당 그 비용이 붙는다.
+ * mode 2(HOT) = delay 0 으로 재무장해 모듈 자신의 WQ_HIGHPRI 워크큐에서 연속 폴링 → kworker 홉 우회.
+ * 트래픽이 흐르는 동안 코어 하나를 태운다(opt-in).
+ * 업스트림 fork 의 hot-poll.patch 는 우리 리비전에 적용되지 않아(hunk 1·7 실패) 손포팅했다.
+ * **native 한정**: Apple 백엔드 RX 프레임은 per-message 시퀀스가 없어 완료 소스를 하나로 유지해야 한다
+ * (기존 주석의 근거). native 는 PSN 기반이고 TX 폴링도 이미 native 한정으로 켜져 있다.
+ */
+static int rx_supp_poll = -1;
+module_param(rx_supp_poll, int, 0644);
+MODULE_PARM_DESC(rx_supp_poll,
+		 "RX 보조 완료 폴링: -1 auto(native 만, 기본), 0 off, 1 on(1ms 주기), 2 HOT(delay-0 재무장, WQ_HIGHPRI, kworker 홉 우회 — 코어 1개 소비). 다음 path 시작 때 적용.");
+
+static int tx_progress_poll = -1;
+module_param(tx_progress_poll, int, 0644);
+MODULE_PARM_DESC(tx_progress_poll,
+		 "TX 진행 폴링: -1 auto(native 만, 기본), 0 off, 1 on(1ms 주기), 2 HOT(delay-0 재무장). 다음 path 시작 때 적용.");
+
 struct tbv_data_frame {
 	struct ring_frame frame;
 	struct tbv_path *path;
@@ -269,7 +290,35 @@ static bool tbv_path_progress_poll_enabled(const struct tbv_path *path)
 	 * the verbs SQ window before macOS has consumed the previous SEND group.
 	 * Use normal NHI TX callbacks for Apple and reserve polling for native.
 	 */
+	if (READ_ONCE(tx_progress_poll) == 0)
+		return false;
+	if (READ_ONCE(tx_progress_poll) > 0)
+		return true;
 	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
+}
+
+/* RX 보조 폴링 활성 여부. auto(-1) 는 native 한정. */
+static bool tbv_path_rx_supp_poll_enabled(const struct tbv_path *path)
+{
+	int mode = READ_ONCE(rx_supp_poll);
+
+	if (!path->rail || !path->rail->peer)
+		return false;
+	if (mode == 0)
+		return false;
+	if (mode > 0)	/* 1/2 는 명시적 opt-in */
+		return path->rail->peer->backend == TBV_BACKEND_NATIVE;
+	return false;	/* auto = 기존 보수적 동작(off) 유지 */
+}
+
+static bool tbv_path_rx_supp_poll_hot(void)
+{
+	return READ_ONCE(rx_supp_poll) == 2;
+}
+
+static bool tbv_path_tx_poll_hot(void)
+{
+	return READ_ONCE(tx_progress_poll) == 2;
 }
 
 static void tbv_path_queue_delayed_work(struct tbv_path *path,
@@ -300,7 +349,8 @@ static void tbv_path_queue_rx_supp_poll(struct tbv_path *path,
 
 	WRITE_ONCE(path->rx_supp_poll_until,
 		   jiffies + msecs_to_jiffies(TBV_RX_SUPP_POLL_WINDOW_MS));
-	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work, delay);
+	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work,
+				    tbv_path_rx_supp_poll_hot() ? 0 : delay);
 }
 
 static void tbv_path_atomic64_max_ms(atomic64_t *counter, u64 value)
@@ -719,6 +769,7 @@ static void tbv_path_tx_poll_work(struct work_struct *work)
 
 	if (atomic_read(&path->tx_inflight) > 0 || completed)
 		tbv_path_queue_tx_poll(path,
+				       tbv_path_tx_poll_hot() ? 0 :
 				       msecs_to_jiffies(TBV_TX_POLL_DELAY_MS));
 }
 
@@ -747,7 +798,8 @@ static void tbv_path_rx_supp_poll_work(struct work_struct *work)
 				     READ_ONCE(path->rx_supp_poll_until)))
 		tbv_path_queue_delayed_work(
 			path, &path->rx_supp_poll_work,
-			msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
+			tbv_path_rx_supp_poll_hot() ? 0 :
+				msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
 }
 
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
@@ -948,6 +1000,11 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 							       add_remote_credits);
 		}
 	}
+
+	/* 수신만 하는 한방향 스트림은 TX post 가 없어 폴러가 무장되지 않는다.
+	 * HOT 모드에서는 RX 경로에서도 무장한다(fork 패치와 동일 취지). */
+	if (tbv_path_rx_supp_poll_hot())
+		tbv_path_queue_rx_supp_poll(path, 0);
 }
 
 static int tbv_path_alloc_frames(struct tbv_path *path, bool tx)
@@ -1231,7 +1288,7 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 	 * completion single-sourced; TX polling is still used for timely send
 	 * completions.
 	 */
-	path->rx_supp_poll_enabled = false;
+	path->rx_supp_poll_enabled = tbv_path_rx_supp_poll_enabled(path);
 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
@@ -2346,16 +2403,20 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		struct page *page = NULL;
 		void *done_ctx = NULL;
 		bool last;
-		dma_addr_t dma;
+		bool premapped = false;
+		dma_addr_t dma = 0;
 		u32 page_off = 0;
 		u32 len = 0;
 
-		ret = next(next_ctx, &page, &page_off, &len, &done, &done_ctx);
+		ret = next(next_ctx, &page, &page_off, &len, &dma, &premapped,
+			   &done, &done_ctx);
 		if (ret)
 			goto err_release;
-		if (!page || !len || len > max_raw_payload ||
+		/* premapped(dma-buf/GPU): dma 는 이미 NHI-매핑, page 없음. */
+		if (!len || len > max_raw_payload ||
 		    len > total_length - prepared ||
-		    page_off > PAGE_SIZE || len > PAGE_SIZE - page_off) {
+		    (!premapped && (!page || page_off > PAGE_SIZE ||
+				    len > PAGE_SIZE - page_off))) {
 			if (done)
 				done(done_ctx, -EINVAL);
 			ret = -EINVAL;
@@ -2364,19 +2425,23 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 
 		last = prepared + len == total_length;
 
-		dma = dma_map_page(dma_dev, page, page_off, len,
-				   DMA_TO_DEVICE);
-		if (dma_mapping_error(dma_dev, dma)) {
-			if (done)
-				done(done_ctx, -EIO);
-			ret = -EIO;
-			goto err_release;
+		if (!premapped) {
+			dma = dma_map_page(dma_dev, page, page_off, len,
+					   DMA_TO_DEVICE);
+			if (dma_mapping_error(dma_dev, dma)) {
+				if (done)
+					done(done_ctx, -EIO);
+				ret = -EIO;
+				goto err_release;
+			}
 		}
 
-		packet = tbv_path_alloc_zcopy_packet(path, dma, len, true,
+		/* unmap_dma=!premapped: dma-buf 매핑은 pin 이 소유(완료시 unmap 금지). */
+		packet = tbv_path_alloc_zcopy_packet(path, dma, len, !premapped,
 						     done, done_ctx);
 		if (!packet) {
-			dma_unmap_page(dma_dev, dma, len, DMA_TO_DEVICE);
+			if (!premapped)
+				dma_unmap_page(dma_dev, dma, len, DMA_TO_DEVICE);
 			if (done)
 				done(done_ctx, -ENOMEM);
 			ret = -ENOMEM;

@@ -19,6 +19,9 @@
 #include <linux/overflow.h>
 #include <linux/refcount.h>
 #include <linux/scatterlist.h>
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
+MODULE_IMPORT_NS("DMA_BUF");	/* dma_buf_vmap/vunmap_unlocked (Layer2 RX GPU-direct) */
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/thunderbolt.h>
@@ -31,6 +34,7 @@
 #include <rdma/ib_umem.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
+#include <rdma/uverbs_ioctl.h>	/* rdma_udata_to_drv_context (유저공간 CQ 빠른경로) */
 
 #include "../proto/apple_tx.h"
 #include "../proto/native_data.h"
@@ -239,9 +243,19 @@ static void tbv_rx_bad_header_parse_note(struct tbv_state *state,
 			    peer_id, rail_id, path_id, (unsigned long long)route);
 }
 
+/* 유저공간 CQ 빠른경로(2026-10-21): 프로바이더가 poll_cq 마다 uverbs syscall 을 하던 것을
+ * (ftrace 실측: tbv_poll_cq 14억 회/60s = tbv 커널시간의 100%, 99.9% 가 빈손) 없앤다.
+ * ucontext 당 공유 페이지 1 개를 read-only 로 mmap(pgoff 0) 하고, 그 **단일 전역 카운터**를
+ * 모든 CQE 적재 때 올린다. 유저공간은 카운터가 그대로면 syscall 없이 0 을 반환한다.
+ * CQ 별 슬롯을 쓰지 않는 이유: 인덱스로 쓸 uverbs CQ handle(`cq->uobject->id`)은
+ * struct ib_ucq_object 가 코어 private 이라 드라이버가 접근할 수 없다. 전역 카운터면
+ * 다른 CQ 의 완료가 이 CQ 의 폴링을 한 번 깨우는 false wakeup 이 생기지만,
+ * 빈 폴링(99.9%)은 그대로 제거되므로 효과의 대부분을 얻는다. */
+
 struct tbv_ucontext {
 	struct ib_ucontext base;
 	struct tbv_state *owner;
+	u64 *cq_counters;	/* 공유 페이지(커널 소유, 유저 read-only) */
 };
 
 struct tbv_pd {
@@ -252,6 +266,7 @@ struct tbv_pd {
 struct tbv_cq {
 	struct ib_cq base;
 	struct tbv_state *owner;
+	u64 *ucounter;		/* ucontext 공유 페이지의 전역 완료카운터(유저 CQ 만, 없으면 NULL) */
 	spinlock_t lock;
 	struct ib_wc *entries;
 	u32 cqe;
@@ -477,6 +492,12 @@ struct tbv_mr {
 	int access;
 	bool closing;
 	bool dma_mr;
+	bool dmabuf;
+	bool dmabuf_vmapped;		/* RX GPU-direct: CPU 매핑 확보됨 */
+	struct iosys_map dmabuf_map;	/* dma_buf_vmap 결과(vaddr/iomem) */
+	u64 dmabuf_offset;		/* reg_user_mr_dmabuf 의 dma-buf 내 시작 오프셋.
+					 * dmabuf_map 은 dma-buf 전체를 0 부터 매핑하므로
+					 * CPU 기록 경로에서 반드시 더해야 한다. */
 };
 
 struct tbv_ah {
@@ -631,6 +652,9 @@ static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx);
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 				   struct page **page_out,
 				   u32 *page_off_out, u32 *len_out);
+/* Layer2: dma-buf(GPU) MR 의 NHI-매핑 sgt 에서 dma_addr 직접 얻기(dma_map 불필요). */
+static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+				  dma_addr_t *dma_out, u32 *len_out);
 static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const struct tbv_recv_wqe *wqe, u32 offset,
 			      const void *payload, u32 len, u32 *delivered);
@@ -834,6 +858,14 @@ out:
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
+	if (mr->dmabuf_vmapped && mr->umem) {
+		struct ib_umem_dmabuf *udb = to_ib_umem_dmabuf(mr->umem);
+
+		if (udb->attach && udb->attach->dmabuf)
+			dma_buf_vunmap_unlocked(udb->attach->dmabuf,
+						&mr->dmabuf_map);
+		mr->dmabuf_vmapped = false;
+	}
 	if (mr->umem)
 		ib_umem_release(mr->umem);
 	if (mr->owner)
@@ -2425,6 +2457,8 @@ static int tbv_alloc_ucontext(struct ib_ucontext *context,
 
 	ctx->owner = tbv_ibdev_state(context->device);
 	atomic_inc(&ctx->owner->verbs_ucontexts);
+	/* 공유 완료카운터 페이지. 실패해도 치명적이지 않다(프로바이더가 기존 syscall 경로로 폴백). */
+	ctx->cq_counters = (u64 *)get_zeroed_page(GFP_KERNEL);
 	return 0;
 }
 
@@ -2435,6 +2469,30 @@ static void tbv_dealloc_ucontext(struct ib_ucontext *context)
 
 	if (ctx->owner)
 		atomic_dec(&ctx->owner->verbs_ucontexts);
+	if (ctx->cq_counters) {
+		free_page((unsigned long)ctx->cq_counters);
+		ctx->cq_counters = NULL;
+	}
+}
+
+/* 공유 완료카운터 페이지를 유저공간에 read-only 로 노출. offset(pgoff) 0 만 허용. */
+static int tbv_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+{
+	struct tbv_ucontext *ctx = container_of(context, struct tbv_ucontext,
+						base);
+
+	if (!ctx->cq_counters)
+		return -ENODEV;
+	if (vma->vm_pgoff != 0)
+		return -EINVAL;
+	if (vma->vm_end - vma->vm_start != PAGE_SIZE)
+		return -EINVAL;
+	if (vma->vm_flags & VM_WRITE)	/* 유저는 읽기만 */
+		return -EPERM;
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	return remap_pfn_range(vma, vma->vm_start,
+			       page_to_pfn(virt_to_page(ctx->cq_counters)),
+			       PAGE_SIZE, vma->vm_page_prot);
 }
 
 static int tbv_alloc_pd(struct ib_pd *pd, struct ib_udata *udata)
@@ -2470,6 +2528,15 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 	spin_lock_init(&tcq->lock);
 	tcq->owner = tbv_ibdev_state(cq->device);
 	tcq->cqe = attr->cqe;
+	/* 유저공간 CQ 면 ucontext 의 전역 완료카운터를 연결(커널 CQ 는 NULL = 기존 동작). */
+	if (attrs) {
+		struct tbv_ucontext *uctx =
+			rdma_udata_to_drv_context(&attrs->driver_udata,
+						  struct tbv_ucontext, base);
+
+		if (uctx && uctx->cq_counters)
+			tcq->ucounter = &uctx->cq_counters[0];
+	}
 	atomic_inc(&tcq->owner->verbs_cqs);
 	return 0;
 }
@@ -3971,7 +4038,7 @@ static int tbv_prepare_send_segments(struct tbv_qp *tqp,
 			ret = -EINVAL;
 			goto err_release;
 		}
-		if (mr->dma_mr) {
+		if (mr->dma_mr) {	/* dmabuf 는 zcopy 경로가 처리(아래) — 여기선 통과 */
 			tbv_mr_put(mr);
 			ret = -EOPNOTSUPP;
 			goto err_release;
@@ -4286,12 +4353,18 @@ static void tbv_send_page_stream_done(void *ctx, int status)
 
 static int tbv_send_page_stream_next(void *ctx, struct page **page,
 				     u32 *page_off, u32 *length,
+				     dma_addr_t *dma, bool *premapped,
 				     tbv_path_tx_done_fn *done,
 				     void **done_ctx)
 {
 	struct tbv_send_page_stream *stream = ctx;
 	u32 skipped = 0;
 	int i;
+
+	*premapped = false;
+	*dma = 0;
+	*page = NULL;
+	*page_off = 0;
 
 	for (i = 0; i < stream->nsegs; i++) {
 		struct tbv_send_segment *seg = &stream->segs[i];
@@ -4309,11 +4382,20 @@ static int tbv_send_page_stream_next(void *ctx, struct page **page,
 		remaining = min_t(u32, seg->length - seg_off,
 				  stream->total_len - stream->offset);
 		remaining = min_t(u32, remaining, stream->max_chunk);
-		ret = tbv_umem_page_from_addr(seg->mr, seg->addr + seg_off,
-					      remaining, page, page_off,
-					      length);
-		if (ret)
-			return ret;
+		if (seg->mr->dmabuf) {
+			/* GPU: NHI-매핑 sgt 의 dma_addr 직접 사용(dma_map 불필요). */
+			ret = tbv_umem_dma_from_addr(seg->mr, seg->addr + seg_off,
+						     remaining, dma, length);
+			if (ret)
+				return ret;
+			*premapped = true;
+		} else {
+			ret = tbv_umem_page_from_addr(seg->mr, seg->addr + seg_off,
+						      remaining, page, page_off,
+						      length);
+			if (ret)
+				return ret;
+		}
 
 		stream->offset += *length;
 		refcount_inc(&stream->refs);
@@ -4381,6 +4463,19 @@ static bool tbv_send_segments_zcopy_safe(struct tbv_send_segment *segs,
 
 			remaining = min_t(u32, seg->length - seg_off,
 					  total_len - offset);
+			if (seg->mr->dmabuf) {
+				/* dma-buf: NHI-매핑 sgt 에서 직접 DMA, CPU page 접근 없음 → 안전. */
+				dma_addr_t dma;
+
+				ret = tbv_umem_dma_from_addr(seg->mr,
+							     seg->addr + seg_off,
+							     remaining, &dma, &len);
+				if (ret || !len)
+					return false;
+				offset += len;
+				found = true;
+				break;
+			}
 			ret = tbv_umem_page_from_addr(seg->mr,
 						      seg->addr + seg_off,
 						      remaining, &page,
@@ -4500,13 +4595,34 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 				    reason, age_ms, atomic_read(&ctx->tx_pending));
 	}
 
-	zcopy_requested = !fragment_striping && tbv_send_ctx_is_write(ctx) &&
-			  tbv_should_zcopy_payload(ctx->total_len);
-	if (zcopy_requested) {
-		raw_zcopy_allowed = tbv_send_ctx_allows_raw_zcopy(ctx);
-		if (raw_zcopy_allowed)
-			zcopy_safe = tbv_send_segments_zcopy_safe(
-				ctx->segs, ctx->nsegs, ctx->total_len);
+	{
+		/* Layer2: segment 들이 dma-buf(GPU) MR 인가? */
+		bool dmabuf_segs = false;
+		int si;
+
+		for (si = 0; si < ctx->nsegs; si++)
+			if (ctx->segs[si].mr && ctx->segs[si].mr->dmabuf) {
+				dmabuf_segs = true;
+				break;
+			}
+
+		/* dma-buf 는 CPU copy 불가 → zcopy 필수(zcopy_min_bytes 무관), WRITE 만. */
+		zcopy_requested = !fragment_striping && tbv_send_ctx_is_write(ctx) &&
+				  (tbv_should_zcopy_payload(ctx->total_len) ||
+				   dmabuf_segs);
+		if (zcopy_requested) {
+			/* dma-buf: retransmit-안전 raw 제약 무시(copy 대안이 없음). */
+			raw_zcopy_allowed = dmabuf_segs ? true :
+				tbv_send_ctx_allows_raw_zcopy(ctx);
+			if (raw_zcopy_allowed)
+				zcopy_safe = tbv_send_segments_zcopy_safe(
+					ctx->segs, ctx->nsegs, ctx->total_len);
+		}
+
+		/* dma-buf 인데 zcopy 경로를 못 타면 조용히 실패(절대 CPU copy 금지). */
+		if (dmabuf_segs &&
+		    !(zcopy_requested && raw_zcopy_allowed && zcopy_safe))
+			return -EOPNOTSUPP;
 	}
 
 	if (zcopy_requested && raw_zcopy_allowed && zcopy_safe) {
@@ -5427,6 +5543,10 @@ static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc)
 	tcq->entries[tcq->tail] = *wc;
 	tcq->tail = (tcq->tail + 1) % tcq->cqe;
 	tcq->count++;
+	/* CQE 를 넣은 **뒤에** 카운터를 올린다(release). 유저공간은 카운터가 변했을 때만
+	 * syscall 로 수거하므로, 순서가 뒤집히면 완료를 놓쳐 hang 이 된다. */
+	if (tcq->ucounter)
+		smp_store_release(tcq->ucounter, *tcq->ucounter + 1);
 	if (tcq->notify_armed) {
 		tcq->notify_armed = false;
 		notify = true;
@@ -6590,6 +6710,20 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 		return -EFAULT;
 
 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	if (mr->dmabuf) {
+		/* RX GPU-direct: 수신 payload 를 GPU dma-buf 의 CPU 매핑에 기록.
+		 * (UMA 에선 DRAM->DRAM memcpy. vmap 미확보면 미지원.) */
+		if (!mr->dmabuf_vmapped)
+			return -EOPNOTSUPP;
+		/* dmabuf_map 은 dma-buf 전체를 0 부터 매핑한 것이고 ib_umem_offset() 은
+		 * 첫 페이지 내 오프셋만 돌려주므로, 등록 오프셋을 여기서 더해야 한다.
+		 * (없으면 nonzero offset MR 에 대한 RDMA_WRITE 가 송신측엔 SUCCESS 인데
+		 *  데이터는 dma-buf 선두에 기록되는 조용한 유실이 발생 — 2026-10-20 실측.) */
+		if (check_add_overflow(offset, (size_t)mr->dmabuf_offset, &offset))
+			return -EINVAL;
+		iosys_map_memcpy_to(&mr->dmabuf_map, offset, src, len);
+		return 0;
+	}
 	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
 				      offset);
 	return copied == len ? 0 : -EFAULT;
@@ -6668,7 +6802,7 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 
 	if (!max_len)
 		return -EINVAL;
-	if (mr->dma_mr)
+	if (mr->dma_mr || mr->dmabuf)
 		return -EOPNOTSUPP;
 	if (check_add_overflow(addr, (u64)max_len, &end))
 		return -EINVAL;
@@ -6704,6 +6838,51 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 		return 0;
 	}
 
+	return -EFAULT;
+}
+
+/*
+ * Layer2 GPU-direct: for a dma-buf MR the payload is already DMA-mapped into the
+ * NHI's IOMMU domain by dma_buf_attach (ib_umem_dmabuf_get_pinned). Walk the
+ * dma-buf sg_table and return the pre-mapped dma_addr + a contiguous chunk at
+ * `addr`, so the NHI frame can post it directly (no dma_map_page, no CPU touch
+ * of GPU device pages).
+ */
+static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+				  dma_addr_t *dma_out, u32 *len_out)
+{
+	struct ib_umem_dmabuf *udb;
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	size_t offset;
+	u64 end, mr_end;
+	unsigned int i;
+
+	if (!mr->dmabuf || !mr->umem || !max_len)
+		return -EINVAL;
+	udb = to_ib_umem_dmabuf(mr->umem);
+	sgt = udb->sgt;			/* set by ib_umem_dmabuf map (pinned) */
+	if (!sgt)
+		return -EINVAL;
+	if (check_add_overflow(addr, (u64)max_len, &end))
+		return -EINVAL;
+	if (check_add_overflow(mr->start, mr->length, &mr_end))
+		return -EINVAL;
+	if (addr < mr->start || end > mr_end)
+		return -EFAULT;
+
+	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		unsigned int dlen = sg_dma_len(sg);
+
+		if (offset >= dlen) {
+			offset -= dlen;
+			continue;
+		}
+		*dma_out = sg_dma_address(sg) + offset;
+		*len_out = min_t(u32, (u32)(dlen - offset), max_len);
+		return 0;
+	}
 	return -EFAULT;
 }
 
@@ -9208,6 +9387,90 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	return &mr->base;
 }
 
+/*
+ * Layer 2 (GPU-direct): register a dma-buf (e.g. ROCm GPU VRAM exported via
+ * hipMemGetHandleForAddressRange) as an MR. ib_umem_dmabuf_get_pinned attaches
+ * the dma-buf to pd->device->dma_device (= the USB4 NHI, c5:00.6) and maps it
+ * into the NHI IOMMU domain. The mr->dmabuf flag routes every CPU-access helper
+ * (copy_to/copy_from/page_from_addr/send-gather) to a clean -EOPNOTSUPP so GPU
+ * device pages are NEVER touched by the CPU (no oops). The real GPU->wire DMA
+ * path (feed the dma-buf sgt DMA addrs to the NHI frame post) is the remaining
+ * datapath work; this cut proves registration + NHI dma_buf_attach succeed.
+ */
+static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
+					    u64 length, u64 virt_addr, int fd,
+					    int access, struct ib_dmah *dmah,
+					    struct uverbs_attr_bundle *attrs)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	struct device *dma_device;
+	struct tbv_mr *mr;
+	int ret;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+	if (dmah)			/* DMA handle hint unsupported */
+		return ERR_PTR(-EOPNOTSUPP);
+
+	/*
+	 * tbv does its own DMA via the thunderbolt ring, so ib_device->dma_device
+	 * is left unset; the NHI dma device is dev.parent (set at register). The
+	 * dma-buf attach needs that device explicitly, else dma_buf_dynamic_attach
+	 * WARNs on dev==NULL and returns -EINVAL.
+	 */
+	dma_device = pd->device->dma_device;
+	if (!dma_device)
+		dma_device = pd->device->dev.parent;
+	if (!dma_device)
+		return ERR_PTR(-ENODEV);
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	/* Pinned: no move_notify needed; attaches+maps to the NHI dma_device. */
+	umem_dmabuf = ib_umem_dmabuf_get_pinned_with_dma_device(pd->device,
+						dma_device, offset, length, fd,
+						access);
+	if (IS_ERR(umem_dmabuf)) {
+		ret = PTR_ERR(umem_dmabuf);
+		kfree(mr);
+		return ERR_PTR(ret);
+	}
+
+	mr->umem = &umem_dmabuf->umem;
+	mr->dmabuf = true;
+	/* RX GPU-direct: dma-buf 를 CPU 로 매핑(iosys_map)해두면 수신 payload 를 GPU 에 기록 가능.
+	 * 실패 시 RX 는 -EOPNOTSUPP(TX 는 무관). UMA 에선 DRAM 매핑. */
+	if (umem_dmabuf->attach && umem_dmabuf->attach->dmabuf &&
+	    dma_buf_vmap_unlocked(umem_dmabuf->attach->dmabuf,
+				  &mr->dmabuf_map) == 0)
+		mr->dmabuf_vmapped = true;
+	mr->base.type = IB_MR_TYPE_USER;
+	mr->base.iova = virt_addr;
+	mr->base.length = length;
+	/*
+	 * tbv 는 sge.addr 를 [mr->start, mr->start+length) 로 검사하고 datapath offset 을
+	 * (addr - mr->start) 로 계산한다. 앱은 sge.addr=iova(GPU VA)를 쓰므로 start=virt_addr.
+	 * dma-buf 내 시작오프셋(reg offset)은 ib_umem_dmabuf_get(offset) 에 이미 반영됨.
+	 */
+	mr->start = virt_addr;
+	mr->length = length;
+	mr->virt_addr = virt_addr;
+	mr->access = access;
+	/* dmabuf_map 은 dma-buf 전체(offset 0 기준) 매핑이므로 등록 오프셋을 따로 보관한다.
+	 * sgt/DMA 경로(TX)는 ib_umem_dmabuf_get(offset) 에 반영돼 있어 영향 없지만,
+	 * RX 의 iosys_map 기록 경로에는 반영되지 않는다(실측 확인). */
+	mr->dmabuf_offset = offset;
+	ret = tbv_mr_publish(mr, pd);
+	if (ret) {
+		ib_umem_release(mr->umem);	/* handles dma-buf umem */
+		kfree(mr);
+		return ERR_PTR(ret);
+	}
+	return &mr->base;
+}
+
 static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct tbv_mr *mr = container_of(ibmr, struct tbv_mr, base);
@@ -9241,6 +9504,7 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.get_dma_mr = tbv_get_dma_mr,
 
 	.alloc_ucontext = tbv_alloc_ucontext,
+	.mmap = tbv_mmap,
 	.dealloc_ucontext = tbv_dealloc_ucontext,
 	.alloc_pd = tbv_alloc_pd,
 	.dealloc_pd = tbv_dealloc_pd,
@@ -9259,6 +9523,7 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.poll_cq = tbv_poll_cq,
 	.req_notify_cq = tbv_req_notify_cq,
 	.reg_user_mr = tbv_reg_user_mr,
+	.reg_user_mr_dmabuf = tbv_reg_user_mr_dmabuf,
 	.dereg_mr = tbv_dereg_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),

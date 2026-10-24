@@ -643,6 +643,7 @@ typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
 typedef int (*tbv_path_tx_fill_fn)(void *ctx, void *dst, u32 len);
 typedef int (*tbv_path_next_page_fn)(void *ctx, struct page **page,
 				     u32 *page_off, u32 *length,
+				     dma_addr_t *dma, bool *premapped,
 				     tbv_path_tx_done_fn *done,
 				     void **done_ctx);
 #define TBV_PATH_SEND_CONTROL	BIT(0)

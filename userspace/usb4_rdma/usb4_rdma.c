@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include "usb4_rdma.h"
 
@@ -92,32 +93,39 @@ static struct ibv_cq *usb4_rdma_create_cq(struct ibv_context *ctx, int num_cqe,
 					  struct ibv_comp_channel *channel,
 					  int comp_vector)
 {
+	struct usb4_rdma_context *uctx =
+		container_of(ctx, struct usb4_rdma_context, base.context);
 	struct ib_uverbs_create_cq_resp resp;
 	struct ibv_create_cq cmd;
-	struct ibv_cq *cq;
+	struct usb4_rdma_cq *ucq;
 	int rv;
 
-	cq = calloc(1, sizeof(*cq));
-	if (!cq)
+	ucq = calloc(1, sizeof(*ucq));
+	if (!ucq)
 		return NULL;
 
-	rv = ibv_cmd_create_cq(ctx, num_cqe, channel, comp_vector, cq,
+	rv = ibv_cmd_create_cq(ctx, num_cqe, channel, comp_vector, &ucq->base,
 			       &cmd, sizeof(cmd), &resp, sizeof(resp));
 	if (rv) {
-		free(cq);
+		free(ucq);
 		errno = rv;
 		return NULL;
 	}
-	return cq;
+	/* 생성 시점의 카운터를 기준값으로 삼는다(이전 완료는 이 CQ 것이 아니다). */
+	if (uctx->cq_counters)
+		ucq->last_seen = __atomic_load_n(&uctx->cq_counters[0],
+						 __ATOMIC_ACQUIRE);
+	return &ucq->base;
 }
 
 static int usb4_rdma_destroy_cq(struct ibv_cq *cq)
 {
+	struct usb4_rdma_cq *ucq = container_of(cq, struct usb4_rdma_cq, base);
 	int rv = ibv_cmd_destroy_cq(cq);
 
 	if (rv)
 		return rv;
-	free(cq);
+	free(ucq);
 	return 0;
 }
 
@@ -187,7 +195,30 @@ static int usb4_rdma_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 static int usb4_rdma_poll_cq(struct ibv_cq *cq, int num_entries,
 			     struct ibv_wc *wc)
 {
-	return ibv_cmd_poll_cq(cq, num_entries, wc);
+	struct usb4_rdma_cq *ucq = container_of(cq, struct usb4_rdma_cq, base);
+	struct usb4_rdma_context *uctx =
+		container_of(cq->context, struct usb4_rdma_context,
+			     base.context);
+	volatile uint64_t *ctr = uctx->cq_counters;
+	uint64_t cur;
+	int n;
+
+	if (!ctr)				/* 공유 페이지 없음 → 기존 경로 */
+		return ibv_cmd_poll_cq(cq, num_entries, wc);
+
+	/* 전역 완료카운터가 그대로면 새 CQE 가 없다 → **syscall 없이** 0 반환.
+	 * 커널은 CQE 를 넣은 뒤 release 로 카운터를 올리므로 여기서 acquire 로 읽으면
+	 * "변했다 == 어딘가에 새 완료가 있다" 가 보장된다(놓침 없음). */
+	cur = __atomic_load_n(&ctr[0], __ATOMIC_ACQUIRE);
+	if (cur == ucq->last_seen)
+		return 0;
+
+	n = ibv_cmd_poll_cq(cq, num_entries, wc);
+	/* 버퍼를 꽉 채웠다면 더 남아 있을 수 있으므로 기준값을 올리지 않는다.
+	 * 덜 채웠다면 이 CQ 는 cur 시점까지 비웠다고 볼 수 있다. */
+	if (n >= 0 && n < num_entries)
+		ucq->last_seen = cur;
+	return n;
 }
 
 static int usb4_rdma_req_notify_cq(struct ibv_cq *cq, int solicited_only)
@@ -307,6 +338,16 @@ static struct verbs_context *usb4_rdma_alloc_context(struct ibv_device *base_dev
 		free(ctx);
 		errno = rv;
 		return NULL;
+	}
+
+	/* 커널의 공유 완료카운터 페이지를 read-only 로 매핑(pgoff 0).
+	 * 성공하면 poll_cq 가 빈손일 때 syscall 없이 0 을 반환한다.
+	 * 커널이 .mmap 을 지원하지 않는 구버전이면 MAP_FAILED → 기존 경로 유지. */
+	{
+		void *pg = mmap(NULL, 4096, PROT_READ, MAP_SHARED, cmd_fd, 0);
+
+		ctx->cq_counters = (pg == MAP_FAILED) ? NULL :
+						       (volatile uint64_t *)pg;
 	}
 
 	verbs_set_ops(&ctx->base, &usb4_rdma_context_ops);
