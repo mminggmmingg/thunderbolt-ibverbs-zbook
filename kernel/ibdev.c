@@ -498,6 +498,13 @@ struct tbv_mr {
 	u64 dmabuf_offset;		/* reg_user_mr_dmabuf 의 dma-buf 내 시작 오프셋.
 					 * dmabuf_map 은 dma-buf 전체를 0 부터 매핑하므로
 					 * CPU 기록 경로에서 반드시 더해야 한다. */
+	/* Where the last CPU copy into or out of the umem landed: the sg entry
+	 * and its byte offset within the umem.  The frames of one WR copy at
+	 * increasing offsets, so the next copy starts here instead of walking
+	 * the list from its head.  Both fields change together under the lock. */
+	spinlock_t sg_hint_lock;
+	struct scatterlist *sg_hint;
+	size_t sg_hint_base;
 };
 
 struct tbv_ah {
@@ -640,6 +647,8 @@ static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
 static void tbv_send_tx_done(void *ctx, int status);
+static int tbv_umem_sg_copy(struct tbv_mr *mr, size_t offset, void *buf,
+			    size_t len, bool to_mr);
 static void tbv_apple_send_tx_done(void *ctx, int status);
 static void tbv_apple_sq_work(struct work_struct *work);
 static void tbv_qp_flush_apple_sq(struct tbv_qp *tqp);
@@ -4158,9 +4167,15 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 			seg_off = offset - skipped;
 
 		chunk = min_t(u32, seg->length - seg_off, length - copied);
-		ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
-					seg->addr + seg_off - seg->mr->start,
-					chunk);
+		if (seg->mr->dma_mr || seg->mr->dmabuf)
+			ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
+						seg->addr + seg_off - seg->mr->start,
+						chunk);
+		else
+			ret = tbv_umem_sg_copy(seg->mr,
+					       ib_umem_offset(seg->mr->umem) +
+					       seg->addr + seg_off - seg->mr->start,
+					       (u8 *)dst + copied, chunk, false);
 		if (ret)
 			return ret;
 		copied += chunk;
@@ -6720,12 +6735,78 @@ static void tbv_qp_flush_apple_sq(struct tbv_qp *tqp)
 	}
 }
 
+/*
+ * Copy between a kernel buffer and a umem MR at a byte offset into the umem
+ * (ib_umem_offset() included).  sg_pcopy_*() and ib_umem_copy_from() find the
+ * offset by stepping page by page from the head of the list, so copying a
+ * large WR frame by frame costs time quadratic in its size; a 1 MiB
+ * bidirectional run spent 40% of its samples in sg_miter_skip() and
+ * __sg_page_iter_next().  This steps whole entries, from the MR's last
+ * position when the offset lies at or after it.
+ */
+static int tbv_umem_sg_copy(struct tbv_mr *mr, size_t offset, void *buf,
+			    size_t len, bool to_mr)
+{
+	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	unsigned long flags;
+	size_t base;
+	u8 *p = buf;
+
+	spin_lock_irqsave(&mr->sg_hint_lock, flags);
+	sg = mr->sg_hint;
+	base = mr->sg_hint_base;
+	spin_unlock_irqrestore(&mr->sg_hint_lock, flags);
+	if (!sg || offset < base) {
+		sg = sgt->sgl;
+		base = 0;
+	}
+	while (sg && offset >= base + sg->length) {
+		base += sg->length;
+		sg = sg_next(sg);
+	}
+	if (!sg)
+		return -EFAULT;
+
+	spin_lock_irqsave(&mr->sg_hint_lock, flags);
+	mr->sg_hint = sg;
+	mr->sg_hint_base = base;
+	spin_unlock_irqrestore(&mr->sg_hint_lock, flags);
+
+	while (len) {
+		size_t in_sg = offset - base;
+		size_t pos = sg->offset + in_sg;
+		struct page *page = pfn_to_page(page_to_pfn(sg_page(sg)) +
+						(pos >> PAGE_SHIFT));
+		size_t pg_off = offset_in_page(pos);
+		size_t chunk = min3(len, (size_t)PAGE_SIZE - pg_off,
+				    (size_t)sg->length - in_sg);
+		u8 *kaddr = kmap_local_page(page);
+
+		if (to_mr) {
+			memcpy(kaddr + pg_off, p, chunk);
+			flush_dcache_page(page);
+		} else {
+			memcpy(p, kaddr + pg_off, chunk);
+		}
+		kunmap_local(kaddr);
+		p += chunk;
+		offset += chunk;
+		len -= chunk;
+		if (len && offset >= base + sg->length) {
+			base += sg->length;
+			sg = sg_next(sg);
+			if (!sg)
+				return -EFAULT;
+		}
+	}
+	return 0;
+}
+
 static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 			    size_t len)
 {
-	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
 	size_t offset;
-	size_t copied;
 	u64 mr_end;
 	u64 end;
 
@@ -6761,9 +6842,7 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 		wmb();
 		return 0;
 	}
-	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
-				      offset);
-	return copied == len ? 0 : -EFAULT;
+	return tbv_umem_sg_copy(mr, offset, (void *)src, len, true);
 }
 
 static int tbv_umem_copy_to_iova(struct tbv_mr *mr, u64 iova,
@@ -6823,7 +6902,10 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 	if (ret)
 		return ret;
 
-	return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+	if (mr->dmabuf)
+		return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
+	return tbv_umem_sg_copy(mr, ib_umem_offset(mr->umem) + addr - mr->start,
+				dst, len, false);
 }
 
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
@@ -9360,6 +9442,7 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
+	spin_lock_init(&mr->sg_hint_lock);
 
 	mr->base.type = IB_MR_TYPE_DMA;
 	mr->base.iova = 0;
@@ -9395,6 +9478,7 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
+	spin_lock_init(&mr->sg_hint_lock);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
 	mr->umem = ib_umem_get_va(pd->device, start, length, access);
@@ -9464,6 +9548,7 @@ static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
+	spin_lock_init(&mr->sg_hint_lock);
 
 	/* Pinned: no move_notify needed; attaches+maps to the NHI dma_device. */
 	umem_dmabuf = ib_umem_dmabuf_get_pinned_with_dma_device(pd->device,
