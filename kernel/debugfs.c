@@ -475,6 +475,11 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->path.rx_supp_poll_enabled,
 				   atomic64_read(&rail->path.rx_supp_poll_calls),
 				   atomic64_read(&rail->path.rx_supp_poll_completed));
+			seq_printf(s,
+				   "    rx_wq enabled=%u calls=%lld completed=%lld\n",
+				   rail->path.rx_wq_enabled,
+				   atomic64_read(&rail->path.rx_wq_calls),
+				   atomic64_read(&rail->path.rx_wq_completed));
 		}
 	}
 	mutex_unlock(&state->lock);

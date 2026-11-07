@@ -190,6 +190,8 @@ struct tbv_path {
 	struct list_head tx_zcopy_inflight;
 	struct delayed_work tx_poll_work;
 	struct delayed_work rx_supp_poll_work;
+	struct work_struct rx_wq_work;
+	struct workqueue_struct *rx_wq;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
@@ -209,6 +211,8 @@ struct tbv_path {
 	atomic64_t tx_poll_completed;
 	atomic64_t rx_supp_poll_calls;
 	atomic64_t rx_supp_poll_completed;
+	atomic64_t rx_wq_calls;
+	atomic64_t rx_wq_completed;
 	unsigned long rx_supp_poll_until;
 	u8 rx_raw_opcode;
 	u8 rx_raw_flags;
@@ -223,6 +227,8 @@ struct tbv_path {
 	bool rx_raw_pending;
 	bool tx_poll_enabled;
 	bool rx_supp_poll_enabled;
+	bool rx_wq_enabled;
+	bool rx_wq_stopping;
 	bool tx_scheduling;
 	bool tx_raw_stream_active;
 	bool tx_raw_stream_end_seen;
